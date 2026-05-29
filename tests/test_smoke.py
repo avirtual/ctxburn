@@ -37,8 +37,9 @@ def test_parse_and_grade():
         assert r["turns"] == 2
         assert r["model"] == "claude-opus-4-7"
         assert r["cost_total"] > 0
-        # cache_read cost = (50000+60000) * 1.50 / 1e6
-        assert abs(r["cost"]["read"] - (110000 * 1.50 / 1e6)) < 1e-9
+        # cache_read cost = (50000+60000) * opus cache-read rate / 1e6
+        p_cr = cli.PRICING["opus"][3]
+        assert abs(r["cost"]["read"] - (110000 * p_cr / 1e6)) < 1e-9
         g, c = cli.grade_session(r)
         assert g in cli.GRADES
 
@@ -49,6 +50,27 @@ def test_pricing_lookup():
     assert cli.price_for("claude-3-5-haiku") == cli.PRICING["haiku"]
     # unknown -> fallback
     assert cli.price_for("gpt-something") == cli.PRICING[cli.PRICING_FALLBACK]
+
+
+def test_dedup_by_message_id():
+    """The same API response is logged multiple times under one message.id;
+    its usage must be counted exactly once (else tokens/cost double)."""
+    with tempfile.TemporaryDirectory() as d:
+        turn = {"type": "assistant", "message": {
+            "role": "assistant", "model": "claude-opus-4-8", "id": "msg_dupe",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"cache_read_input_tokens": 40000, "output_tokens": 100,
+                      "cache_creation_input_tokens": 0, "input_tokens": 0}},
+            "timestamp": "2099-01-01T00:01:00Z"}
+        p = os.path.join(d, "dup00000-0000-0000-0000-000000000000.jsonl")
+        with open(p, "w") as fh:
+            # same message.id written three times (streaming partials + final)
+            for _ in range(3):
+                fh.write(json.dumps(turn) + "\n")
+        r = cli.parse_session(p)
+        assert r["turns"] == 1                       # not 3
+        assert r["area"] == 40000                     # cache_read counted once
+        assert r["output"] == 100
 
 
 def test_window_independent_grade():

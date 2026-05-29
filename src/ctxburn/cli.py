@@ -37,12 +37,13 @@ DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 # Matched by FIRST substring hit against the turn's `model` field, so list most-specific
 # keys first (e.g. "opus-4-8" before "opus"); falls back to sonnet for unknown models.
 PRICING = {
-    # opus-4-8 is ~1/3 the older Opus list price. Verified against `claude /usage`:
-    # these rates reproduce the CLI's reported cost to the cent on a real session.
-    "opus-4-8": (5.00,  25.00,  6.25, 0.50),
-    "opus":     (15.00, 75.00, 18.75, 1.50),
-    "sonnet":   (3.00,  15.00,  3.75, 0.30),
-    "haiku":    (0.80,   4.00,  1.00, 0.08),
+    # Current Opus 4.x ($5/$25/$6.25/$0.50) — NOT the old $15/$75 list. Verified
+    # against `claude /usage` on two independent sessions: opus-4-8 (cost matched
+    # to the cent) and opus-4-6 (aggregate cost reproduced within a web-search
+    # rounding). If you have older opus-3 data ($15/$75), add an explicit entry.
+    "opus":   (5.00, 25.00, 6.25, 0.50),
+    "sonnet": (3.00, 15.00, 3.75, 0.30),
+    "haiku":  (0.80,  4.00, 1.00, 0.08),
 }
 PRICING_FALLBACK = "sonnet"
 
