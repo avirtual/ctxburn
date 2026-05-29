@@ -34,11 +34,15 @@ DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 
 # Per-model list prices, USD per *million* tokens: (input, output, cache_write_5m, cache_read).
 # These are public list prices — enterprise contracts differ. Override with --price-* or edit here.
-# Matched by substring against the turn's `model` field; falls back to sonnet for unknown models.
+# Matched by FIRST substring hit against the turn's `model` field, so list most-specific
+# keys first (e.g. "opus-4-8" before "opus"); falls back to sonnet for unknown models.
 PRICING = {
-    "opus":   (15.00, 75.00, 18.75, 1.50),
-    "sonnet": (3.00,  15.00,  3.75, 0.30),
-    "haiku":  (0.80,   4.00,  1.00, 0.08),
+    # opus-4-8 is ~1/3 the older Opus list price. Verified against `claude /usage`:
+    # these rates reproduce the CLI's reported cost to the cent on a real session.
+    "opus-4-8": (5.00,  25.00,  6.25, 0.50),
+    "opus":     (15.00, 75.00, 18.75, 1.50),
+    "sonnet":   (3.00,  15.00,  3.75, 0.30),
+    "haiku":    (0.80,   4.00,  1.00, 0.08),
 }
 PRICING_FALLBACK = "sonnet"
 
@@ -100,6 +104,9 @@ def parse_session(path):
     turn_cost = []                 # USD incurred per assistant turn (for ramp milestones)
     models = Counter()
     cwds = Counter()
+    seen_msg = set()               # dedup: each API response is logged multiple times
+                                   # (streaming partials + final) under one message.id;
+                                   # counting every record double-counts tokens & cost.
 
     try:
         fh = open(path, encoding="utf-8")
@@ -129,6 +136,12 @@ def parse_session(path):
                 ot = u.get("output_tokens", 0) or 0
                 if cr + cc + ot == 0:
                     continue
+                # one API response, logged multiple times -> count its usage once
+                mid = m.get("id") or o.get("requestId")
+                if mid is not None:
+                    if mid in seen_msg:
+                        continue
+                    seen_msg.add(mid)
                 crs.append(cr)
                 out_tot += ot
                 mdl = m.get("model", "")
