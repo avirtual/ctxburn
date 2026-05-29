@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctxburn"
+version = "0.1.0"
+description = "Grade your Claude Code sessions on token cost. No deps, reads JSONL transcripts."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Bogdan Ionescu" }]
+keywords = ["claude", "claude-code", "llm", "tokens", "cost", "context", "agentic"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/avirtual/ctxburn"
+Issues = "https://github.com/avirtual/ctxburn/issues"
+
+[project.scripts]
+ctxburn = "ctxburn.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

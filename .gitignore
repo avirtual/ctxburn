@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# transcripts / local data (never commit other people's sessions)
+*.jsonl
+*.db
+*.db-shm
+*.db-wal
+
+# OS
+.DS_Store
+
+# graphify hook artifacts (PreToolUse rebuild writes here)
+graphify-out/
+.graphify_*
