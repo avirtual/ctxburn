@@ -168,6 +168,9 @@ def parse_session(path):
     cwds = Counter()
     sub_turns = 0                  # subagent/sidechain turns (cost folded in, grade excluded)
     sub_cost = 0.0
+    boot_write_tokens = 0          # cache-write tokens on the cold-boot (first main) turn
+    boot_input_tokens = 0          # uncached input tokens on that same turn
+    boot_floor_cost = 0.0          # USD a restart re-pays (write-rate, NOT read-rate)
     seen_msg = set()               # dedup: each API response is logged multiple times
                                    # (streaming partials + final) under one message.id;
                                    # counting every record double-counts tokens & cost.
@@ -227,6 +230,13 @@ def parse_session(path):
                     continue
 
                 crs.append(cr)
+                if len(crs) == 1:
+                    # Cold-boot turn: the context is cache-WRITTEN here (cc), not read
+                    # (cr0 is ~0 — nothing prior to read). This one-time write is the
+                    # floor a restart re-pays, priced ~12.5x the per-turn read replay.
+                    boot_write_tokens = cc
+                    boot_input_tokens = it
+                    boot_floor_cost = (cc * p_cw + it * p_in) / 1e6
                 out_tot += ot
                 models[mdl] += 1
                 turn_cost.append(tc)
@@ -261,6 +271,15 @@ def parse_session(path):
     peak = max(crs)
     sess_avg = area / n
     last10 = sum(crs[-10:]) / min(10, n)
+
+    # where-to-cut: first turn (1-based) at which the context curve crossed each
+    # grade band — turns a tail-only grade into a concrete "compact here" turn.
+    crossings = []
+    for band in GRADE_BANDS:
+        for i, c in enumerate(crs):
+            if c >= band:
+                crossings.append((band, i + 1))
+                break
 
     # cumulative cost through the first N turns — shows how fast the bill ramps.
     # For sessions shorter than N, this equals the full cost (whole session ran).
@@ -303,6 +322,8 @@ def parse_session(path):
         cost=cost, cost_total=sum(cost.values()),
         sub_turns=sub_turns, sub_cost=sub_cost,
         cost25=c25, cost50=c50, cost100=c100,
+        boot_write_tokens=boot_write_tokens, boot_input_tokens=boot_input_tokens,
+        boot_floor_cost=boot_floor_cost, crossings=crossings,
         model=(models.most_common(1)[0][0] if models else "?"),
     )
 
@@ -470,6 +491,15 @@ def findings_and_suggestions(r, window):
                  f"({100*r['multi']/r['toolcalls']:.0f}%) — most calls took a separate round trip.")
         S.append("Batch independent reads/greps into one turn; each saved round trip "
                  "removes a full context re-read.")
+    if r.get("crossings"):
+        parts = ", ".join(f"{fmt_k(b)} at turn {t}" for b, t in r["crossings"])
+        # anchor the cut advice at the 130K ("getting heavy") crossing if it happened,
+        # else the heaviest band actually crossed.
+        cut = next((t for b, t in r["crossings"] if b == 130_000),
+                   r["crossings"][-1][1])
+        F.append(f"Where to cut: context crossed {parts}.")
+        S.append(f"A /clear or /compact near turn {cut} would have capped context for "
+                 f"every later turn — that crossing is where the costly tail begins.")
     return F, S
 
 def report(sessions, window, top, as_json):
@@ -484,7 +514,8 @@ def report(sessions, window, top, as_json):
     if as_json:
         out = [{k: r[k] for k in ("sid", "project", "model", "turns", "compactions",
                                   "area", "peak", "sess_avg", "last10", "output",
-                                  "cost25", "cost50", "cost100",
+                                  "cost25", "cost50", "cost100", "boot_floor_cost",
+                                  "boot_write_tokens", "crossings",
                                   "cost_total", "grade", "improvable")} for r in graded]
         print(json.dumps(out, indent=2))
         return
@@ -564,6 +595,64 @@ def report(sessions, window, top, as_json):
     print()
 
 
+def report_by_project(sessions, window, as_json):
+    """Roll grades up by project (cwd). Surfaces the cross-session cost driver a
+    per-session view hides: restart-heavy agents re-pay their boot context every
+    cold start. `boots` = session count (each JSONL is one cold context load);
+    `boot-floor` = the one-time cache-WRITE re-paid on each of those boots."""
+    for r in sessions:
+        r["grade"], _ = grade_session(r, window)
+
+    groups = defaultdict(list)
+    for r in sessions:
+        groups[r["project"]].append(r)
+
+    rows = []
+    for proj, rs in groups.items():
+        grades = [r["grade"] for r in rs]
+        worst = max(grades, key=GRADES.index)
+        avg = GRADES[round(sum(GRADES.index(g) for g in grades) / len(grades))]
+        rows.append(dict(
+            project=proj, sessions=len(rs),
+            cost=sum(r["cost_total"] for r in rs),
+            replay=sum(r["area"] for r in rs),
+            boot_floor=sum(r.get("boot_floor_cost", 0.0) for r in rs),
+            worst=worst, avg=avg,
+        ))
+    rows.sort(key=lambda x: -x["cost"])
+
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    n_proj = len(rows)
+    tot_cost = sum(x["cost"] for x in rows)
+    tot_boot = sum(x["boot_floor"] for x in rows)
+    tot_sess = sum(x["sessions"] for x in rows)
+    print()
+    print(bold(f"ctxburn by project — {n_proj} project{'s' if n_proj != 1 else ''} · "
+               f"{tot_sess} sessions · ${tot_cost:,.0f} total · "
+               f"${tot_boot:,.0f} boot-floor"))
+    print(color("boots = sessions (each cold-loads context). boot-floor = the one-time "
+                "cache-WRITE a restart re-pays, summed across boots.", "2"))
+
+    grade_col = lambda v, p: color(p, GRADE_COLOR.get(v.strip(), ""))
+    money = lambda v: f"${v:,.0f}"
+    headers = ["PROJECT", "BOOTS", "WORST", "AVG", "REPLAY", "BOOT-FLOOR", "TOTAL"]
+    aligns  = ["l", "r", "l", "l", "r", "r", "r"]
+    table = [[pretty_path(x["project"], 40), x["sessions"], x["worst"], x["avg"],
+              f"{x['replay']/1e6:.0f}M", money(x["boot_floor"]), money(x["cost"])]
+             for x in rows[:TABLE_CAP]]
+    colorizers = [None, None, grade_col, None, None, None, None]
+    print()
+    for line in render_table(headers, table, aligns, colorizers=colorizers):
+        print("  " + line)
+    overflow = len(rows) - len(table)
+    if overflow > 0:
+        print(color(f"  … +{overflow} more project(s) not shown.", "2"))
+    print()
+
+
 # ---------- cli ----------
 
 def collect_files(path, session):
@@ -594,6 +683,8 @@ def main(argv=None):
     ap.add_argument("--min-turns", type=int, default=20)
     ap.add_argument("--top", type=int, default=6)
     ap.add_argument("--window", type=int, default=200_000)
+    ap.add_argument("--by-project", action="store_true",
+                    help="roll cost/grades up by project (cwd); show restart boot-floor")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
 
@@ -631,6 +722,11 @@ def main(argv=None):
         scope = "any time" if a.all else f"the last {a.since} days"
         print(f"no gradeable sessions (>= {a.min_turns} turns) in {scope}. "
               f"Try --all or --since N.", file=sys.stderr)
+        return 0
+
+    # project rollup: cross-session view of the restart/boot-floor cost driver
+    if a.by_project:
+        report_by_project(sessions, a.window, a.json)
         return 0
 
     # single-session mode: always show full detail regardless of grade

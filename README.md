@@ -58,10 +58,13 @@ ctxburn --since 30             # last 30 days
 ctxburn --session 845a0984     # full report for one session id
 ctxburn --top 10               # detail the 10 most-improvable sessions
 ctxburn --window 1000000       # context window for the ceiling-risk flag
+ctxburn --by-project           # roll cost/grades up by project, with restart boot-floor
 ctxburn --json                 # machine-readable output
 ```
 
 By default it focuses on the sessions worth improving (grade C/D/F) and collapses the efficient ones to a one-liner.
+
+`--by-project` rolls the per-session view up by project (cwd): one row per project with its boot count (= sessions, each a cold context load), worst/avg grade, total replay, and **boot-floor** — the one-time cache *write* a restart re-pays on each cold boot, summed across boots. It's the cross-session lens: a restart-heavy agent's bill is `boots × (boot-floor + the read-replay tail each session then grows)`, which no single-session view shows. Per-session detail also now prints a **"where to cut"** line — the turn index where context first crossed each grade band, i.e. where a `/clear` would have capped the tail.
 
 ## How the grade works
 
