@@ -97,6 +97,7 @@ def parse_session(path):
     key_turns = defaultdict(list)
     last_ts = None
     cost = dict(read=0.0, write=0.0, inp=0.0, out=0.0)  # USD by tier
+    turn_cost = []                 # USD incurred per assistant turn (for ramp milestones)
     models = Counter()
     cwds = Counter()
 
@@ -133,10 +134,12 @@ def parse_session(path):
                 mdl = m.get("model", "")
                 models[mdl] += 1
                 p_in, p_out, p_cw, p_cr = price_for(mdl)
+                tc = (cr * p_cr + cc * p_cw + it * p_in + ot * p_out) / 1e6
                 cost["read"]  += cr * p_cr / 1e6
                 cost["write"] += cc * p_cw / 1e6
                 cost["inp"]   += it * p_in / 1e6
                 cost["out"]   += ot * p_out / 1e6
+                turn_cost.append(tc)
                 ntool = 0
                 for b in (m.get("content") or []):
                     if isinstance(b, dict) and b.get("type") == "tool_use":
@@ -163,6 +166,17 @@ def parse_session(path):
     peak = max(crs)
     sess_avg = area / n
     last10 = sum(crs[-10:]) / min(10, n)
+
+    # cumulative cost through the first N turns — shows how fast the bill ramps.
+    # For sessions shorter than N, this equals the full cost (whole session ran).
+    cum = []
+    run = 0.0
+    for tc in turn_cost:
+        run += tc
+        cum.append(run)
+    def cost_through(k):
+        return cum[min(k, len(cum)) - 1] if cum else 0.0
+    c25, c50, c100 = cost_through(25), cost_through(50), cost_through(100)
 
     # dead-weight carry: result size * turns replayed after its key was last touched
     stale = 0
@@ -192,6 +206,7 @@ def parse_session(path):
         output=out_tot, toolcalls=toolcalls, multi=multi,
         stale=stale, offenders=offenders, top_reread=top_reread,
         cost=cost, cost_total=sum(cost.values()),
+        cost25=c25, cost50=c50, cost100=c100,
         model=(models.most_common(1)[0][0] if models else "?"),
     )
 
@@ -229,6 +244,16 @@ def improvable_score(r, window=None):
 
 def fmt_k(x):
     return f"{x/1e3:.0f}K"
+
+def short_model(m):
+    """claude-opus-4-6 -> opus-4-6; keep unknowns as-is, cap length."""
+    if not m or m == "?":
+        return "?"
+    s = m
+    for pre in ("claude-", "anthropic/", "anthropic."):
+        if s.startswith(pre):
+            s = s[len(pre):]
+    return s[:14]
 
 def pretty_path(p, width=52):
     home = os.path.expanduser("~")
@@ -339,6 +364,7 @@ def report(sessions, window, top, as_json):
     if as_json:
         out = [{k: r[k] for k in ("sid", "project", "model", "turns", "compactions",
                                   "area", "peak", "sess_avg", "last10", "output",
+                                  "cost25", "cost50", "cost100",
                                   "cost_total", "grade", "improvable")} for r in graded]
         print(json.dumps(out, indent=2))
         return
@@ -370,11 +396,14 @@ def report(sessions, window, top, as_json):
     table_rows = table_src[:TABLE_CAP]
 
     grade_col = lambda v, p: color(p, GRADE_COLOR.get(v.strip(), ""))
-    headers = ["", "SESSION", "PROJECT", "TURNS", "COMP", "LAST-10", "COST"]
-    aligns  = ["l", "l", "l", "r", "r", "r", "r"]
+    money = lambda v: f"${v:,.0f}"
+    headers = ["", "SESSION", "PROJECT", "MODEL", "TURNS", "COMP", "LAST-10",
+               "@25", "@50", "@100", "TOTAL"]
+    aligns  = ["l", "l", "l", "l", "r", "r", "r", "r", "r", "r", "r"]
     rows = [[r["grade"], r["sid"], pretty_path(r["project"], 34),
-             r["turns"], r["compactions"], fmt_k(r["last10"]),
-             f"${r['cost_total']:,.0f}"] for r in table_rows]
+             short_model(r["model"]), r["turns"], r["compactions"],
+             fmt_k(r["last10"]), money(r["cost25"]), money(r["cost50"]),
+             money(r["cost100"]), money(r["cost_total"])] for r in table_rows]
     print()
     for line in render_table(headers, rows, aligns, colorizers=[grade_col]):
         print("  " + line)
