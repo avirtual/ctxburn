@@ -33,7 +33,7 @@ from collections import defaultdict, Counter
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 
 # Per-model list prices, USD per *million* tokens: (input, output, cache_write_5m, cache_read).
-# These are public list prices — enterprise contracts differ. Override with --price-* or edit here.
+# These are public list prices — enterprise contracts differ. Edit this dict to override.
 # Matched by FIRST substring hit against the turn's `model` field, so list most-specific
 # keys first (e.g. "opus-4-8" before "opus"); falls back to sonnet for unknown models.
 # Source: https://platform.claude.com/docs/en/about-claude/pricing (verified
