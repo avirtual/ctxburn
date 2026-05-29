@@ -449,9 +449,10 @@ def findings_and_suggestions(r, window):
     if r["turns"] >= 150 and r["compactions"] == 0:
         F.append(f"Ran {r['turns']} turns without a single compaction — "
                  f"every late turn re-sent the entire accumulated history.")
-        S.append("Compact or /clear *early and repeatedly*. The first ~100 turns are "
-                 "nearly free; cost is in the tail you let grow. A reset caps the "
-                 "context height for every turn after it.")
+        S.append("Compact or /clear *early and repeatedly*. Cost per turn is the "
+                 "context you carry, not the turn number — once the tail is heavy "
+                 "every remaining turn pays for it. A reset caps context height for "
+                 "every turn after it, so the earlier you cut the more turns benefit.")
     if r["offenders"]:
         (name, k), (st, ca, cnt) = r["offenders"][0]
         kd = str(k[1])[:50] if k and k[1] else "?"
