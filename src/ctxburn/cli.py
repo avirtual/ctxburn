@@ -101,6 +101,56 @@ def _key_of(name, inp):
         return ("search", str(inp.get("pattern") or inp.get("glob")))
     return (name, json.dumps(inp)[:60])
 
+def _fold_subagent_dir(path, seen_msg, cost):
+    """Fold cost from subagent transcripts stored in a `<session>/subagents/`
+    subdirectory next to the main transcript (a layout used by some Claude Code
+    / Agent-SDK versions). Updates `cost` in place; returns (turns, usd).
+    Costs only — subagent context does not enter the main grade curve.
+    (The inline-`isSidechain` layout is handled directly in parse_session.)"""
+    stem = os.path.basename(path)
+    if stem.endswith(".jsonl"):
+        stem = stem[:-6]
+    subdir = os.path.join(os.path.dirname(path), stem, "subagents")
+    st, scost = 0, 0.0
+    for sf in sorted(glob.glob(os.path.join(subdir, "*.jsonl"))):
+        try:
+            fh = open(sf, encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                m = o.get("message", {})
+                if not (isinstance(m, dict) and m.get("role") == "assistant"):
+                    continue
+                u = m.get("usage") or {}
+                cr = u.get("cache_read_input_tokens", 0) or 0
+                cc = u.get("cache_creation_input_tokens", 0) or 0
+                it = u.get("input_tokens", 0) or 0
+                ot = u.get("output_tokens", 0) or 0
+                if cr + cc + ot == 0:
+                    continue
+                mid = m.get("id") or o.get("requestId")
+                if mid is not None:
+                    if mid in seen_msg:
+                        continue
+                    seen_msg.add(mid)
+                p_in, p_out, p_cw, p_cr = price_for(m.get("model", ""))
+                ws = (u.get("server_tool_use") or {}).get("web_search_requests", 0) or 0
+                sc = ws * WEB_SEARCH_PER_1K / 1000.0
+                cost["read"]   += cr * p_cr / 1e6
+                cost["write"]  += cc * p_cw / 1e6
+                cost["inp"]    += it * p_in / 1e6
+                cost["out"]    += ot * p_out / 1e6
+                cost["search"] += sc
+                st += 1
+                scost += (cr * p_cr + cc * p_cw + it * p_in + ot * p_out) / 1e6 + sc
+    return st, scost
+
+
 def parse_session(path):
     """Return a metrics dict for one .jsonl session, or None if not gradeable."""
     crs = []                       # cache_read per assistant turn (the context curve)
@@ -116,6 +166,8 @@ def parse_session(path):
     turn_cost = []                 # USD incurred per assistant turn (for ramp milestones)
     models = Counter()
     cwds = Counter()
+    sub_turns = 0                  # subagent/sidechain turns (cost folded in, grade excluded)
+    sub_cost = 0.0
     seen_msg = set()               # dedup: each API response is logged multiple times
                                    # (streaming partials + final) under one message.id;
                                    # counting every record double-counts tokens & cost.
@@ -140,7 +192,7 @@ def parse_session(path):
                 comps += 1
             t = o.get("type")
             m = o.get("message", {})
-            if t == "assistant" and isinstance(m, dict) and m.get("role") == "assistant":
+            if isinstance(m, dict) and m.get("role") == "assistant":
                 u = m.get("usage") or {}
                 cr = u.get("cache_read_input_tokens", 0) or 0
                 cc = u.get("cache_creation_input_tokens", 0) or 0
@@ -154,21 +206,29 @@ def parse_session(path):
                     if mid in seen_msg:
                         continue
                     seen_msg.add(mid)
-                crs.append(cr)
-                out_tot += ot
                 mdl = m.get("model", "")
-                models[mdl] += 1
                 p_in, p_out, p_cw, p_cr = price_for(mdl)
-                tc = (cr * p_cr + cc * p_cw + it * p_in + ot * p_out) / 1e6
-                cost["read"]  += cr * p_cr / 1e6
-                cost["write"] += cc * p_cw / 1e6
-                cost["inp"]   += it * p_in / 1e6
-                cost["out"]   += ot * p_out / 1e6
-                # server-side web search: $10 / 1000 searches (web fetch is free)
                 ws = (u.get("server_tool_use") or {}).get("web_search_requests", 0) or 0
                 sc = ws * WEB_SEARCH_PER_1K / 1000.0
+                tc = (cr * p_cr + cc * p_cw + it * p_in + ot * p_out) / 1e6 + sc
+                # cost is whole-work-session (main loop + Task-tool subagents)
+                cost["read"]   += cr * p_cr / 1e6
+                cost["write"]  += cc * p_cw / 1e6
+                cost["inp"]    += it * p_in / 1e6
+                cost["out"]    += ot * p_out / 1e6
                 cost["search"] += sc
-                tc += sc
+
+                # A subagent/sidechain turn carries its own context, not the main
+                # loop's — fold its COST in, but keep it out of the context curve so
+                # the grade reflects the main session's discipline.
+                if bool(o.get("isSidechain")) or t != "assistant":
+                    sub_turns += 1
+                    sub_cost += tc
+                    continue
+
+                crs.append(cr)
+                out_tot += ot
+                models[mdl] += 1
                 turn_cost.append(tc)
                 ntool = 0
                 for b in (m.get("content") or []):
@@ -187,6 +247,11 @@ def parse_session(path):
                         if tid in pending:
                             at, name, k = pending.pop(tid)
                             results.append((at, name, k, _tok(_text_of(b.get("content")))))
+
+    # fold in any subagent transcripts stored in a sibling <session>/subagents/ dir
+    fst, fsc = _fold_subagent_dir(path, seen_msg, cost)
+    sub_turns += fst
+    sub_cost += fsc
 
     n = len(crs)
     if n == 0:
@@ -236,6 +301,7 @@ def parse_session(path):
         output=out_tot, toolcalls=toolcalls, multi=multi,
         stale=stale, offenders=offenders, top_reread=top_reread,
         cost=cost, cost_total=sum(cost.values()),
+        sub_turns=sub_turns, sub_cost=sub_cost,
         cost25=c25, cost50=c50, cost100=c100,
         model=(models.most_common(1)[0][0] if models else "?"),
     )
@@ -366,6 +432,9 @@ def findings_and_suggestions(r, window):
              f"of generated output ({out_pct:.1f}%).")
     c, ct = r["cost"], r["cost_total"] or 1e-9
     ctx_cost = c["read"] + c["write"]
+    if r.get("sub_turns"):
+        F.append(f"Work-session cost includes {r['sub_turns']} subagent turn(s) "
+                 f"(${r['sub_cost']:.2f}) folded in alongside the main loop.")
     F.append(f"Cost: ${r['cost_total']:.2f} on {r['model']} — "
              f"context replay+write ${ctx_cost:.2f} ({100*ctx_cost/ct:.0f}%), "
              f"output ${c['out']:.2f} ({100*c['out']/ct:.0f}%). "

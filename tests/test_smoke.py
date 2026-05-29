@@ -73,6 +73,37 @@ def test_dedup_by_message_id():
         assert r["output"] == 100
 
 
+def test_subagent_cost_folded_grade_excluded():
+    """A Task-tool subagent turn (sidechain, own model) adds to work-session
+    cost but must NOT enter the main context curve / turn count / grade."""
+    with tempfile.TemporaryDirectory() as d:
+        main = {"type": "assistant", "message": {
+            "role": "assistant", "model": "claude-opus-4-8", "id": "m_main",
+            "content": [{"type": "text", "text": "main"}],
+            "usage": {"cache_read_input_tokens": 50000, "output_tokens": 200,
+                      "cache_creation_input_tokens": 0, "input_tokens": 0}},
+            "timestamp": "2099-01-01T00:01:00Z"}
+        sub = {"type": "assistant", "isSidechain": True, "message": {
+            "role": "assistant", "model": "claude-haiku-4-5", "id": "m_sub",
+            "content": [{"type": "text", "text": "sub"}],
+            "usage": {"cache_read_input_tokens": 80000, "output_tokens": 500,
+                      "cache_creation_input_tokens": 0, "input_tokens": 0}},
+            "timestamp": "2099-01-01T00:01:30Z"}
+        p = os.path.join(d, "sub00000-0000-0000-0000-000000000000.jsonl")
+        with open(p, "w") as fh:
+            fh.write(json.dumps(main) + "\n")
+            fh.write(json.dumps(sub) + "\n")
+        r = cli.parse_session(p)
+        assert r["turns"] == 1            # main only — subagent excluded from curve
+        assert r["area"] == 50000         # context curve is the main loop's
+        assert r["sub_turns"] == 1
+        # subagent cost priced at HAIKU rate, folded into the total
+        hp = cli.PRICING["haiku"]
+        exp_sub = (80000 * hp[3] + 500 * hp[1]) / 1e6
+        assert abs(r["sub_cost"] - exp_sub) < 1e-9
+        assert r["cost_total"] > r["cost_total"] - r["sub_cost"] > 0
+
+
 def test_window_independent_grade():
     """Same session must get the same grade regardless of --window (cost != capacity)."""
     with tempfile.TemporaryDirectory() as d:
