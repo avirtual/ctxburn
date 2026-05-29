@@ -36,16 +36,26 @@ DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 # These are public list prices — enterprise contracts differ. Override with --price-* or edit here.
 # Matched by FIRST substring hit against the turn's `model` field, so list most-specific
 # keys first (e.g. "opus-4-8" before "opus"); falls back to sonnet for unknown models.
+# Source: https://platform.claude.com/docs/en/about-claude/pricing (verified
+# against `claude /usage` on real opus-4-6 and opus-4-8 sessions, matched to
+# the cent). Keys are matched by FIRST substring hit, so the legacy-priced
+# variants are listed BEFORE the generic family key.
 PRICING = {
-    # Current Opus 4.x ($5/$25/$6.25/$0.50) — NOT the old $15/$75 list. Verified
-    # against `claude /usage` on two independent sessions: opus-4-8 (cost matched
-    # to the cent) and opus-4-6 (aggregate cost reproduced within a web-search
-    # rounding). If you have older opus-3 data ($15/$75), add an explicit entry.
-    "opus":   (5.00, 25.00, 6.25, 0.50),
-    "sonnet": (3.00, 15.00, 3.75, 0.30),
-    "haiku":  (0.80,  4.00, 1.00, 0.08),
+    # Opus 4.1 is the OLD $15/$75 tier (deprecated). Listed first so it wins the
+    # substring match before the current "opus" entry. (Base Opus 4 is retired
+    # and won't appear in Claude Code transcripts, so it isn't special-cased.)
+    "opus-4-1": (15.00, 75.00, 18.75, 1.50),
+    # Current Opus (4.5 / 4.6 / 4.7 / 4.8) — $5/$25, 1/3 of the old list price.
+    "opus":     (5.00,  25.00,  6.25, 0.50),
+    "sonnet":   (3.00,  15.00,  3.75, 0.30),
+    # Current Haiku 4.5. (Retired Haiku 3.5 was 0.80/4.00/1.00/0.08.)
+    "haiku":    (1.00,   5.00,  1.25, 0.10),
 }
 PRICING_FALLBACK = "sonnet"
+# Caveat: Opus 4.7+ use a new tokenizer (~35% more tokens for the same text).
+# Cost here is exact (it reads real usage counts from the transcript); only the
+# char/4 estimate in _tok (dead-weight/offender heuristic) under-counts on 4.7+.
+# Also: US-only inference (inference_geo="us") adds a 1.1x multiplier not modeled.
 
 def price_for(model):
     lo = (model or "").lower()
