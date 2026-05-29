@@ -205,6 +205,7 @@ GRADES = ["A", "B", "C", "D", "F"]
 # whether 488K is 49% of a 1M window or 244% of a 200K one — the bill is the same.
 GRADE_BANDS = [40_000, 80_000, 130_000, 180_000]  # A|B|C|D|F cutoffs
 HEALTHY_CTX = 60_000  # a lean working context for a coding session
+TABLE_CAP = 20        # max rows in the overview table (keeps output friendly)
 
 def grade_session(r, window=None):
     """Grade on absolute last-10-turn avg context (= cost per turn).
@@ -236,6 +237,51 @@ def pretty_path(p, width=52):
     if p and len(p) > width:
         p = "\u2026" + p[-(width - 1):]
     return p
+
+
+# ---------- table rendering ----------
+
+def _use_color():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+GRADE_COLOR = {"A": "32", "B": "36", "C": "33", "D": "33;1", "F": "31"}
+
+def color(s, code):
+    if not code or not _use_color():
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+def bold(s):
+    return color(s, "1")
+
+def render_table(headers, rows, aligns, colorizers=None):
+    """Aligned text table. aligns: per-col 'l'/'r'. colorizers: per-col
+    callable(raw_value, padded_str)->str or None (color applied after padding
+    so width alignment stays correct)."""
+    widths = [len(str(h)) for h in headers]
+    for row in rows:
+        for i, c in enumerate(row):
+            widths[i] = max(widths[i], len(str(c)))
+
+    def pad(i, c):
+        c = str(c)
+        return c.rjust(widths[i]) if aligns[i] == "r" else c.ljust(widths[i])
+
+    def fmt(row, header=False):
+        cells = []
+        for i, c in enumerate(row):
+            p = pad(i, c)
+            if header:
+                p = bold(p)
+            elif colorizers and i < len(colorizers) and colorizers[i]:
+                p = colorizers[i](str(c), p)
+            cells.append(p)
+        return "  ".join(cells).rstrip()
+
+    rule = "  ".join("\u2500" * w for w in widths)
+    out = [fmt(headers, header=True), rule]
+    out += [fmt(r) for r in rows]
+    return out
 
 def findings_and_suggestions(r, window):
     F, S = [], []
@@ -303,42 +349,66 @@ def report(sessions, window, top, as_json):
     dist = defaultdict(int)
     for r in graded:
         dist[r["grade"]] += 1
-    print(f"\n{'='*72}")
-    print(f"SESSION GRADER — {n} sessions · {total_replay/1e6:.0f}M replay tokens · "
-          f"${total_cost:,.0f} total")
-    print(f"grades: " + "  ".join(f"{g}:{dist[g]}" for g in GRADES if dist[g]))
-    print(f"grade = last-10-turn avg context (absolute tokens/turn = cost). "
-          f"window {window//1000}K used only for the ceiling-risk flag.")
-    print(f"{'='*72}")
 
-    detail = [r for r in graded if r["grade"] in ("C", "D", "F")][:top]
+    # ---- banner ----
+    title = (f"ctxburn — {n} session{'s' if n != 1 else ''} · "
+             f"{total_replay/1e6:.0f}M replay tokens · ${total_cost:,.0f} total")
+    print()
+    print(bold(title))
+    grade_chips = "   ".join(color(f"{g} {dist[g]}", GRADE_COLOR[g])
+                             for g in GRADES if dist[g])
+    print("grades:  " + grade_chips)
+    print(color("grade = last-10-turn avg context carried per turn (= $/turn). "
+                 f"window {window//1000}K is a ceiling-risk flag only.", "2"))
+
+    # ---- overview table, worst-improvable first, bounded for friendliness ----
+    # Lead with the sessions worth improving (C/D/F); fall back to the full
+    # roster only when everything is already efficient.
+    improvable = [r for r in graded if r["grade"] in ("C", "D", "F")]
+    efficient = [r for r in graded if r["grade"] in ("A", "B")]
+    table_src = improvable if improvable else graded
+    table_rows = table_src[:TABLE_CAP]
+
+    grade_col = lambda v, p: color(p, GRADE_COLOR.get(v.strip(), ""))
+    headers = ["", "SESSION", "PROJECT", "TURNS", "COMP", "LAST-10", "COST"]
+    aligns  = ["l", "l", "l", "r", "r", "r", "r"]
+    rows = [[r["grade"], r["sid"], pretty_path(r["project"], 34),
+             r["turns"], r["compactions"], fmt_k(r["last10"]),
+             f"${r['cost_total']:,.0f}"] for r in table_rows]
+    print()
+    for line in render_table(headers, rows, aligns, colorizers=[grade_col]):
+        print("  " + line)
+
+    overflow = len(table_src) - len(table_rows)
+    tail = []
+    if overflow > 0:
+        tail.append(f"+{overflow} more improvable session(s) not shown")
+    if improvable and efficient:
+        tail.append(f"{len(efficient)} efficient (A/B) hidden")
+    if tail:
+        print(color("  … " + " · ".join(tail) + ".", "2"))
+
+    # ---- detailed findings for the most improvable C/D/F sessions ----
+    detail = improvable[:top]
+    if detail:
+        print()
+        print(bold(f"  WHERE IT HURT — top {len(detail)} improvable session"
+                   f"{'s' if len(detail) != 1 else ''}"))
     for r in detail:
         F, S = findings_and_suggestions(r, window)
         print(f"\n  {'─'*72}")
-        print(f"  [{r['grade']}]  {r['sid']}  ({pretty_path(r['project'])})  ${r['cost_total']:,.0f}")
+        print(f"  {color('['+r['grade']+']', GRADE_COLOR.get(r['grade'], ''))}  "
+              f"{bold(r['sid'])}  {pretty_path(r['project'])}  "
+              f"${r['cost_total']:,.0f}")
         print(f"       last-10 avg {fmt_k(r['last10'])} · {r['turns']} turns · "
               f"{r['compactions']} compactions · {r['area']/1e6:.1f}M replay")
-        print(f"     FINDINGS:")
+        print(f"     {bold('FINDINGS')}")
         for x in F:
             print(f"       - {x}")
-        print(f"     SUGGESTIONS:")
+        print(f"     {bold('SUGGESTIONS')}")
         for x in S:
             print(f"       > {x}")
 
-    shown = {r["sid"] for r in detail}
-    rest = [r for r in graded if r["sid"] not in shown]
-    if rest:
-        good = [r for r in rest if r["grade"] in ("A", "B")]
-        mid = [r for r in rest if r["grade"] not in ("A", "B")]
-        print(f"\n  {'-'*68}")
-        if mid:
-            print(f"  {len(mid)} more improvable session(s) not detailed (raise --top to see):")
-            for r in mid:
-                print(f"     [{r['grade']}] {r['sid']} {fmt_k(r['last10'])} last-10 · {r['turns']}t")
-        if good:
-            print(f"  {len(good)} efficient session(s) (A/B) — skipped: "
-                  + ", ".join(r["sid"] for r in good[:12])
-                  + (" ..." if len(good) > 12 else ""))
     print()
 
 
