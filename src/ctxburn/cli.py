@@ -52,6 +52,7 @@ PRICING = {
     "haiku":    (1.00,   5.00,  1.25, 0.10),
 }
 PRICING_FALLBACK = "sonnet"
+WEB_SEARCH_PER_1K = 10.00   # server-side web search: $10 per 1,000 searches
 # Caveat: Opus 4.7+ use a new tokenizer (~35% more tokens for the same text).
 # Cost here is exact (it reads real usage counts from the transcript); only the
 # char/4 estimate in _tok (dead-weight/offender heuristic) under-counts on 4.7+.
@@ -111,7 +112,7 @@ def parse_session(path):
     results = []                   # (turn, name, key, result_tokens)
     key_turns = defaultdict(list)
     last_ts = None
-    cost = dict(read=0.0, write=0.0, inp=0.0, out=0.0)  # USD by tier
+    cost = dict(read=0.0, write=0.0, inp=0.0, out=0.0, search=0.0)  # USD by component
     turn_cost = []                 # USD incurred per assistant turn (for ramp milestones)
     models = Counter()
     cwds = Counter()
@@ -163,6 +164,11 @@ def parse_session(path):
                 cost["write"] += cc * p_cw / 1e6
                 cost["inp"]   += it * p_in / 1e6
                 cost["out"]   += ot * p_out / 1e6
+                # server-side web search: $10 / 1000 searches (web fetch is free)
+                ws = (u.get("server_tool_use") or {}).get("web_search_requests", 0) or 0
+                sc = ws * WEB_SEARCH_PER_1K / 1000.0
+                cost["search"] += sc
+                tc += sc
                 turn_cost.append(tc)
                 ntool = 0
                 for b in (m.get("content") or []):
@@ -332,6 +338,26 @@ def render_table(headers, rows, aligns, colorizers=None):
     out += [fmt(r) for r in rows]
     return out
 
+COST_COMPONENTS = [
+    ("read",   "cache read (context replay)"),
+    ("write",  "cache write"),
+    ("out",    "output (generated)"),
+    ("inp",    "input (uncached)"),
+    ("search", "web search"),
+]
+
+def cost_breakdown_lines(r, indent="       "):
+    """Per-component cost table: $ and % of session total, largest first."""
+    c, tot = r["cost"], (r["cost_total"] or 1e-9)
+    rows = [(label, c.get(key, 0.0)) for key, label in COST_COMPONENTS]
+    rows = [(lbl, v) for lbl, v in rows if v > 0]
+    rows.sort(key=lambda x: -x[1])
+    headers = ["COMPONENT", "COST", "SHARE"]
+    table = [[lbl, f"${v:,.2f}", f"{100*v/tot:.0f}%"] for lbl, v in rows]
+    table.append(["total", f"${r['cost_total']:,.2f}", "100%"])
+    out = render_table(headers, table, ["l", "r", "r"])
+    return [indent + ln for ln in out]
+
 def findings_and_suggestions(r, window):
     F, S = [], []
     out_pct = 100 * r["output"] / r["area"] if r["area"] else 0
@@ -455,6 +481,9 @@ def report(sessions, window, top, as_json):
               f"${r['cost_total']:,.0f}")
         print(f"       last-10 avg {fmt_k(r['last10'])} · {r['turns']} turns · "
               f"{r['compactions']} compactions · {r['area']/1e6:.1f}M replay")
+        print(f"     {bold('COST BREAKDOWN')}")
+        for ln in cost_breakdown_lines(r):
+            print(ln)
         print(f"     {bold('FINDINGS')}")
         for x in F:
             print(f"       - {x}")
@@ -541,9 +570,12 @@ def main(argv=None):
             r["improvable"] = improvable_score(r, a.window)
             F, S = findings_and_suggestions(r, a.window)
             print(f"\n  [{r['grade']}]  {r['sid']}  ({pretty_path(r['project'])})")
-            print(f"     FINDINGS:")
+            print(f"     {bold('COST BREAKDOWN')}")
+            for ln in cost_breakdown_lines(r):
+                print(ln)
+            print(f"     {bold('FINDINGS')}")
             for x in F: print(f"       - {x}")
-            print(f"     SUGGESTIONS:")
+            print(f"     {bold('SUGGESTIONS')}")
             for x in S: print(f"       > {x}")
         print()
         return 0
