@@ -66,6 +66,10 @@ By default it focuses on the sessions worth improving (grade C/D/F) and collapse
 
 `--by-project` rolls the per-session view up by project (cwd): one row per project with its boot count (= sessions, each a cold context load), worst/avg grade, total replay, and **boot-floor** — the one-time cache *write* a restart re-pays on each cold boot, summed across boots. It's the cross-session lens: a restart-heavy agent's bill is `boots × (boot-floor + the read-replay tail each session then grows)`, which no single-session view shows. Per-session detail also now prints a **"where to cut"** line — the turn index where context first crossed each grade band, i.e. where a `/clear` would have capped the tail.
 
+## Cold-cache misses (the "walked away and came back" tax)
+
+The prompt cache has a **5-minute TTL**. If you step away mid-session and return after more than 5 minutes, the cache has expired — the next turn re-sends your *entire* context as a cache **write** (~12.5× the read rate) instead of a cheap read. ctxburn flags these: a turn with near-zero cache-read but a large cache-write (>50K tokens), preceded by a >5-minute idle gap. It reports how many happened, the longest idle gap, the cost, and the avoidable portion (write-rate minus read-rate). Two real ~190-turn Opus sessions doing near-identical work cost $30 vs $49 — **$10.33 of the gap was nothing but cold re-writes from leaving the session open across idle gaps** (one 6.5-hour gap). The fix is free: finish in focused sittings, or `/clear` before you step away — a small fresh context is cheaper to rebuild than a large one is to cold-re-write. This is a cost-leak flag, not a grade input (the grade stays your last-10 context height).
+
 ## How the grade works
 
 The grade is the **last-10-turn average context** — the tokens you were re-sending every turn by the end of the session. This is absolute (tokens = dollars), **not** normalized by window: replaying 200K tokens costs the same whether your window is 200K or 1M, so window size doesn't change your grade. It's used only for a secondary "you're near the ceiling" risk flag.

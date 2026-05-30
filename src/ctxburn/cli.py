@@ -101,6 +101,15 @@ def _key_of(name, inp):
         return ("search", str(inp.get("pattern") or inp.get("glob")))
     return (name, json.dumps(inp)[:60])
 
+def _parse_ts(s):
+    """ISO-8601 timestamp -> aware datetime, or None if absent/unparseable."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
 def _fold_subagent_dir(path, seen_msg, cost):
     """Fold cost from subagent transcripts stored in a `<session>/subagents/`
     subdirectory next to the main transcript (a layout used by some Claude Code
@@ -171,6 +180,13 @@ def parse_session(path):
     boot_write_tokens = 0          # cache-write tokens on the cold-boot (first main) turn
     boot_input_tokens = 0          # uncached input tokens on that same turn
     boot_floor_cost = 0.0          # USD a restart re-pays (write-rate, NOT read-rate)
+    cold_misses = 0                # turns that cold-re-wrote context after a cache expiry
+    cold_miss_cost = 0.0           # USD actually paid re-writing context on those turns
+    cold_miss_penalty = 0.0        # excess vs a warm cache-read (the avoidable part)
+    cold_miss_tokens = 0           # context tokens cold-re-written (for the surface text)
+    max_idle_gap_min = 0.0         # longest gap between consecutive main turns (minutes)
+    idle_gaps_over_5min = 0        # count of >5min gaps (each a cache-TTL expiry)
+    prev_turn_ts = None            # timestamp of the previous main-loop turn
     seen_msg = set()               # dedup: each API response is logged multiple times
                                    # (streaming partials + final) under one message.id;
                                    # counting every record double-counts tokens & cost.
@@ -230,6 +246,21 @@ def parse_session(path):
                     continue
 
                 crs.append(cr)
+                # inter-turn idle gap (prompt cache TTL is 5 min). Computed BEFORE the
+                # miss check because a cold-miss must be attributable to an expired
+                # cache — a large re-write after a <5min gap is invalidation from
+                # another cause, not idle expiry. No timestamps -> gap is None, skip.
+                tts = _parse_ts(ts)
+                gap_min = None
+                if tts is not None and prev_turn_ts is not None:
+                    gap_min = (tts - prev_turn_ts).total_seconds() / 60.0
+                    if gap_min > 5:
+                        idle_gaps_over_5min += 1
+                    if gap_min > max_idle_gap_min:
+                        max_idle_gap_min = gap_min
+                if tts is not None:
+                    prev_turn_ts = tts
+
                 if len(crs) == 1:
                     # Cold-boot turn: the context is cache-WRITTEN here (cc), not read
                     # (cr0 is ~0 — nothing prior to read). This one-time write is the
@@ -237,6 +268,18 @@ def parse_session(path):
                     boot_write_tokens = cc
                     boot_input_tokens = it
                     boot_floor_cost = (cc * p_cw + it * p_in) / 1e6
+                elif (cc > 50_000 and cr < 0.1 * cc
+                      and gap_min is not None and gap_min > 5):
+                    # Cache-EXPIRY cold re-write (turn index > 1): almost nothing read
+                    # from cache (cr≈0) while a large context was re-written at the
+                    # write rate, AND a >5min idle gap preceded it so the 5-min prompt-
+                    # cache TTL had lapsed. The gap is required: it's what distinguishes
+                    # an idle-return re-write (the avoidable cost) from a same-sitting
+                    # cache invalidation (e.g. turn 54 in fixture 1a94dd9e: 1min gap).
+                    cold_misses += 1
+                    cold_miss_cost += cc * p_cw / 1e6
+                    cold_miss_penalty += cc * (p_cw - p_cr) / 1e6
+                    cold_miss_tokens += cc
                 out_tot += ot
                 models[mdl] += 1
                 turn_cost.append(tc)
@@ -324,6 +367,9 @@ def parse_session(path):
         cost25=c25, cost50=c50, cost100=c100,
         boot_write_tokens=boot_write_tokens, boot_input_tokens=boot_input_tokens,
         boot_floor_cost=boot_floor_cost, crossings=crossings,
+        cold_misses=cold_misses, cold_miss_cost=cold_miss_cost,
+        cold_miss_penalty=cold_miss_penalty, cold_miss_tokens=cold_miss_tokens,
+        max_idle_gap_min=max_idle_gap_min, idle_gaps_over_5min=idle_gaps_over_5min,
         model=(models.most_common(1)[0][0] if models else "?"),
     )
 
@@ -500,6 +546,16 @@ def findings_and_suggestions(r, window):
         F.append(f"Where to cut: context crossed {parts}.")
         S.append(f"A /clear or /compact near turn {cut} would have capped context for "
                  f"every later turn — that crossing is where the costly tail begins.")
+    if r.get("cold_misses"):
+        avg_ctx = r["cold_miss_tokens"] / r["cold_misses"]
+        gap = r.get("max_idle_gap_min", 0.0)
+        F.append(f"Cold-cache re-writes: {r['cold_misses']} turn(s) re-wrote context "
+                 f"from scratch after the 5-min cache TTL expired during idle gaps "
+                 f"(longest {gap:.0f}min). Cost ${r['cold_miss_cost']:.2f} "
+                 f"(${r['cold_miss_penalty']:.2f} avoidable vs a warm read) — each "
+                 f"re-paid ~{fmt_k(avg_ctx)} of context at ~12.5x the read rate.")
+        S.append("Finish in focused sittings, or /clear before stepping away — a fresh "
+                 "small context is cheaper than cold-re-writing a large one on return.")
     return F, S
 
 def report(sessions, window, top, as_json):
@@ -516,6 +572,8 @@ def report(sessions, window, top, as_json):
                                   "area", "peak", "sess_avg", "last10", "output",
                                   "cost25", "cost50", "cost100", "boot_floor_cost",
                                   "boot_write_tokens", "crossings",
+                                  "cold_misses", "cold_miss_cost", "cold_miss_penalty",
+                                  "max_idle_gap_min", "idle_gaps_over_5min",
                                   "cost_total", "grade", "improvable")} for r in graded]
         print(json.dumps(out, indent=2))
         return

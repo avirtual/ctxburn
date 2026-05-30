@@ -211,3 +211,65 @@ def test_by_project_grouping_and_sort():
         expA = (8000 * p_cw) / 1e6 + (5000 * p_cw) / 1e6
         assert abs(rows[0]["boot_floor"] - expA) < 1e-12
         assert rows[0]["cost"] >= rows[1]["cost"]
+
+
+def test_cold_miss_detected_after_idle_gap():
+    """A turn that re-writes a large context (cc) with ~0 cache-read, preceded by
+    a >5min idle gap, is a cold-cache miss: the 5-min TTL expired and the whole
+    context was re-written at the write rate. Priced cost + avoidable penalty."""
+    with tempfile.TemporaryDirectory() as d:
+        recs = [
+            _asst("claude-opus-4-7", cr=0, cc=100000, it=0, mid="m0",
+                  ts="2099-01-01T00:00:00Z"),                     # turn1: cold boot
+            _asst("claude-opus-4-7", cr=0, cc=200000, it=0, mid="m1",
+                  ts="2099-01-01T00:10:00Z"),                     # turn2: 10min gap -> miss
+        ]
+        r = cli.parse_session(_write(d, "cm100000-0000-0000-0000-000000000000.jsonl", recs))
+        p_in, p_out, p_cw, p_cr = cli.PRICING["opus"]
+        assert r["cold_misses"] == 1                              # boot turn excluded
+        assert abs(r["cold_miss_cost"] - (200000 * p_cw) / 1e6) < 1e-12
+        assert abs(r["cold_miss_penalty"] - (200000 * (p_cw - p_cr)) / 1e6) < 1e-12
+        assert r["idle_gaps_over_5min"] == 1
+        assert abs(r["max_idle_gap_min"] - 10.0) < 1e-9
+
+
+def test_cold_miss_requires_gap_not_just_signature():
+    """The cr=0/large-cc signature alone is NOT a miss — a <5min gap means the
+    cache did not expire from idle (it was invalidated by some other cause, e.g.
+    fixture 1a94dd9e turn 54). The >5min gap is part of the predicate."""
+    with tempfile.TemporaryDirectory() as d:
+        recs = [
+            _asst("claude-opus-4-7", cr=0, cc=100000, mid="s0",
+                  ts="2099-01-01T00:00:00Z"),                     # boot
+            _asst("claude-opus-4-7", cr=0, cc=200000, mid="s1",
+                  ts="2099-01-01T00:01:00Z"),                     # 1min gap -> NOT a miss
+        ]
+        r = cli.parse_session(_write(d, "cm200000-0000-0000-0000-000000000000.jsonl", recs))
+        assert r["cold_misses"] == 0
+        assert r["cold_miss_cost"] == 0.0
+        assert r["idle_gaps_over_5min"] == 0
+
+
+def test_cold_miss_excludes_boot_turn():
+    """Turn-1 is the cold boot (captured as boot-floor), never a cold miss, even
+    though it has the cr=0/large-cc shape."""
+    with tempfile.TemporaryDirectory() as d:
+        recs = [_asst("claude-opus-4-7", cr=0, cc=300000, it=400, mid="only",
+                      ts="2099-01-01T00:00:00Z")]
+        r = cli.parse_session(_write(d, "cm300000-0000-0000-0000-000000000000.jsonl", recs))
+        assert r["cold_misses"] == 0
+        assert r["boot_write_tokens"] == 300000
+
+
+def test_cold_miss_no_timestamps_skips_silently():
+    """Sessions without timestamps can't be attributed to a cache expiry — detect
+    no misses and don't crash (the gap is unknowable)."""
+    with tempfile.TemporaryDirectory() as d:
+        recs = [
+            _asst("claude-opus-4-7", cr=0, cc=100000, mid="n0", ts=None),
+            _asst("claude-opus-4-7", cr=0, cc=200000, mid="n1", ts=None),
+        ]
+        r = cli.parse_session(_write(d, "cm400000-0000-0000-0000-000000000000.jsonl", recs))
+        assert r["cold_misses"] == 0
+        assert r["max_idle_gap_min"] == 0.0
+        assert r["idle_gaps_over_5min"] == 0
